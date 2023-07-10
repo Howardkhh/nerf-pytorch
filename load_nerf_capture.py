@@ -75,7 +75,7 @@ def load_nerf_capture_data(basedir, half_res=False, testskip=1):
     H, W = imgs[0].shape[:2]
     focal = metas['train'][0]['fl_x']
     
-    render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
+    render_poses = torch.stack([pose_spherical(angle, -30.0, 2.0) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
     
     if half_res:
         H = H//2

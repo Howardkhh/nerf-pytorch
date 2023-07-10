@@ -19,3 +19,8 @@ precrop_frac = 0.5
 half_res = True
 
 testskip = 1
+
+i_video = 25000
+
+netchunk_per_gpu = 262144
+chunk = 32768

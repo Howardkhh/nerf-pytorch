@@ -189,11 +189,11 @@ def create_nerf(args):
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
     
-    if torch.cuda.device_count() > 1:
-        print("Using", torch.cuda.device_count(), "GPUs!")
+    if args.n_gpus > 1:
         model = nn.DataParallel(model)
+    model = model.to(device)
 
     grad_vars = list(model.parameters())
 
@@ -201,13 +201,16 @@ def create_nerf(args):
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+        if args.n_gpus > 1:
+            model_fine = nn.DataParallel(model_fine)
+        model_fine = model_fine.to(device)
         grad_vars += list(model_fine.parameters())
 
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
-                                                                netchunk=args.netchunk)
+                                                                netchunk=args.netchunk_per_gpu*args.n_gpus)
 
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
@@ -265,7 +268,7 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+def xraw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -368,7 +371,7 @@ def render_rays(ray_batch,
 
     z_vals = z_vals.expand([N_rays, N_samples])
 
-    if perturb > 0.:
+    if perturb > 0.: # sample randomly within each intervals
         # get intervals between samples
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
@@ -454,7 +457,7 @@ def config_parser():
                         help='exponential learning rate decay (in 1000 steps)')
     parser.add_argument("--chunk", type=int, default=1024*32, 
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*64, 
+    parser.add_argument("--netchunk_per_gpu", type=int, default=1024*64*1, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
@@ -542,6 +545,10 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
 
+    # multi-GPU training
+    args.n_gpus = torch.cuda.device_count()
+    print(f"Using {args.n_gpus} GPU(s).")
+
     # Load data
     K = None
     if args.dataset_type == 'llff':
@@ -573,6 +580,7 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
+        # render_poses: the poses to render the video, hwf: height width focal, i_split: indicies for train, val, test split
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
@@ -580,7 +588,7 @@ def train():
         near = 2.
         far = 6.
 
-        if args.white_bkgd:
+        if args.white_bkgd: # make transparent pixels white
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
         else:
             images = images[...,:3]
@@ -614,8 +622,8 @@ def train():
         print('Loaded nerf capture', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
-        near = 2.
-        far = 6.
+        near = 0.
+        far = 5.
 
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -626,11 +634,12 @@ def train():
     H, W = int(H), int(W)
     hwf = [H, W, focal]
 
+    # intrinsic matrix
     if K is None:
         K = np.array([
-            [focal, 0, 0.5*W],
-            [0, focal, 0.5*H],
-            [0, 0, 1]
+            [focal, 0,      0.5*W],
+            [0,     focal,  0.5*H],
+            [0,     0,      1]
         ])
 
     if args.render_test:
@@ -652,7 +661,7 @@ def train():
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
-    global_step = start
+    global_step = start # continue training
 
     bds_dict = {
         'near' : near,
@@ -685,7 +694,7 @@ def train():
 
             return
 
-    # Prepare raybatch tensor if batching random rays
+    # Prepare raybatch tensor if batching random rays from different images
     N_rand = args.N_rand
     use_batching = not args.no_batching
     if use_batching:
@@ -747,9 +756,9 @@ def train():
             pose = poses[img_i, :3,:4]
 
             if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # origin: (H, W, 3), direction: (H, W, 3)
 
-                if i < args.precrop_iters:
+                if i < args.precrop_iters: # training with cropped image before args.precrop_iters
                     dH = int(H//2 * args.precrop_frac)
                     dW = int(W//2 * args.precrop_frac)
                     coords = torch.stack(
@@ -762,13 +771,13 @@ def train():
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                coords = torch.reshape(coords, [-1,2])  # pixel coords: (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
-                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3) # pixel color
 
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
@@ -781,7 +790,7 @@ def train():
         loss = img_loss
         psnr = mse2psnr(img_loss)
 
-        if 'rgb0' in extras:
+        if 'rgb0' in extras: # the output of coarse model
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
